@@ -1,0 +1,38 @@
+1. Position Analysis (Smart Filtering)
+
+"Which forwards have more than 10 goals?"
+
+"Who are the top defenders with more than 5 assists?"
+
+"List the best goalkeepers."
+
+
+-------------------------------------------------
+
+2. Player Performance
+
+"How many goals did Mohamed Salah score?"
+
+"How many assists did Kevin De Bruyne provide?"
+
+"Show me the total points for Harry Kane."
+
+"Tell me about Bukayo Saka's performance."
+
+----------------------------------------------------
+
+3. Player Comparison
+
+
+"Compare Mohamed Salah and Harry Kane."
+
+"Who is better: Haaland or Rashford?"
+
+"Compare the goals of Son and Maddison."
+------------------------------------------
+
+4. Team Analysis & Fixtures
+
+"Show me Liverpool's clean sheets."
+
+

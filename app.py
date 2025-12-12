@@ -1,14 +1,14 @@
-# app.py – full, self-contained Streamlit UI + real FPL back-end
+# app.py – Final Version: Readable Answers + Robust Schema Detection
 # ============================================================================
-import numpy as np
 import streamlit as st
-import json
 import pandas as pd
+import numpy as np
+import json
+import re
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 import streamlit.components.v1 as components
 from pyvis.network import Network
-import re
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import atexit
@@ -19,21 +19,82 @@ import os
 # ------------------------------------------------------
 def read_config(config_file='config.txt'):
     config = {}
-    with open(config_file, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith('#') or not line:
-                continue
-            if '=' in line:
-                key, value = line.split('=', 1)
-                config[key.strip()] = value.strip()
-    config['URI'] = config.get('NEO4J_URI') or config.get('URI')
-    config['USERNAME'] = config.get('NEO4J_USERNAME') or config.get('USERNAME')
-    config['PASSWORD'] = config.get('NEO4J_PASSWORD') or config.get('PASSWORD')
+    if os.path.exists(config_file):
+        with open(config_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('#') or not line: continue
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    config[key.strip()] = value.strip()
+    config['URI'] = config.get('NEO4J_URI') or config.get('URI') or "bolt://localhost:7687"
+    config['USERNAME'] = config.get('NEO4J_USERNAME') or config.get('USERNAME') or "neo4j"
+    config['PASSWORD'] = config.get('NEO4J_PASSWORD') or config.get('PASSWORD') or "password"
     return config
 
 # ------------------------------------------------------
-# 1.  Pre-processing classes (minimal notebook copy)
+# 1.  Neo4j Wrapper & Schema Detection
+# ------------------------------------------------------
+class Neo4jExecutor:
+    def __init__(self, uri, user, pwd):
+        try:
+            self.driver = GraphDatabase.driver(uri, auth=(user, pwd))
+            self.driver.verify_connectivity()
+        except Exception as e:
+            st.error(f"Failed to connect to Neo4j: {e}")
+            self.driver = None
+
+    def close(self): 
+        if self.driver: self.driver.close()
+        
+    def run(self, query, params=None):
+        if not self.driver: return []
+        try:
+            with self.driver.session() as s:
+                return [r.data() for r in s.run(query, params or {})]
+        except Exception as e:
+            return [{"error": str(e)}]
+
+CONFIG = read_config()
+NEO = Neo4jExecutor(CONFIG['URI'], CONFIG['USERNAME'], CONFIG['PASSWORD'])
+atexit.register(NEO.close)
+
+# --- Schema Auto-Detection ---
+@st.cache_resource
+def detect_schema_and_data():
+    player_prop = "player_name"
+    team_prop = "team_name"
+    players = []
+    teams = []
+    
+    if NEO.driver:
+        try:
+            # Detect Player Property
+            check1 = NEO.run("MATCH (p:Player) RETURN p.player_name AS name LIMIT 1")
+            if not check1 or 'name' not in check1[0] or check1[0]['name'] is None:
+                check2 = NEO.run("MATCH (p:Player) RETURN p.name AS name LIMIT 1")
+                if check2 and 'name' in check2[0]: player_prop = "name"
+            
+            # Detect Team Property
+            check_t1 = NEO.run("MATCH (t:Team) RETURN t.team_name AS name LIMIT 1")
+            if not check_t1 or 'name' not in check_t1[0] or check_t1[0]['name'] is None:
+                check_t2 = NEO.run("MATCH (t:Team) RETURN t.name AS name LIMIT 1")
+                if check_t2 and 'name' in check_t2[0]: team_prop = "name"
+
+            # Load Data
+            p_data = NEO.run(f"MATCH (p:Player) RETURN p.{player_prop} AS name")
+            players = [r['name'] for r in p_data if r['name']]
+            t_data = NEO.run(f"MATCH (t:Team) RETURN t.{team_prop} AS name")
+            teams = [r['name'] for r in t_data if r['name']]
+            
+        except Exception as e: print(f"Schema Error: {e}")
+            
+    return player_prop, team_prop, teams, players
+
+PLAYER_PROP, TEAM_PROP, KG_TEAMS, KG_PLAYERS = detect_schema_and_data()
+
+# ------------------------------------------------------
+# 2.  Robust Pre-processing
 # ------------------------------------------------------
 @dataclass
 class ProcessedInput:
@@ -45,299 +106,248 @@ class ProcessedInput:
     cypher_params: Dict[str, any]
 
 class FPLInputPreprocessor:
-    def __init__(self, embedding_model_name: str = "all-MiniLM-L6-v2",
-                 team_names_from_kg: Optional[List[str]] = None,
-                 player_names_from_kg: Optional[List[str]] = None):
+    def __init__(self, kg_teams: List[str], kg_players: List[str], embedding_model_name: str = "all-MiniLM-L6-v2"):
+        self.valid_teams = kg_teams
+        self.valid_players = kg_players
+        
         self.intent_patterns = {
-            'player_performance': [r'\b(goals?|assists?|points?|stats?|performance|how many|how much)\b'],
-            'player_comparison':  [r'\b(compare|versus|vs\.?|better|who.*better)\b'],
-            'team_analysis':      [r'\b(team|defence|attack|clean sheets)\b'],
-            'fixture_query':      [r'\b(fixture|gameweek|gw|when.*play)\b'],
-            'position_analysis':  [r'\b(top|best).*?\b(defenders?|midfielders?|forwards?|goalkeepers?|def|mid|fwd|gk)\b'],
-            'recommendation':     [r'\b(recommend|suggest|should i|captain)\b'],
-            'search_player':      [r'\b(tell me about|who is|info about)\b'],
+            'player_performance': [(r'\b(goals?|assists?|points?|stats?|performance|how many|score)\b', 1.8)],
+            'player_comparison': [(r'\b(compare|versus|vs\.?|better|who.*better)\b', 2.5)],
+            'team_analysis': [(r'\b(team|club|stats?|defence|attack|clean sheets)\b', 2.0)],
+            'fixture_query': [(r'\b(fixture|gameweek|gw|when.*play|schedule|against)\b', 2.5)],
+            'position_analysis': [
+                (r'\b(top|best|highest|list)\b.*\b(defenders?|midfielders?|forwards?|goalkeepers?)\b', 2.2),
+                (r'\b(def|mid|fwd|gk)\b', 2.0),
+                (r'\b(more than|less than|have|with)\b', 2.0)
+            ],
+            'recommendation': [(r'\b(recommend|suggest|should i|captain|pick)\b', 3.0)]
         }
-        team_regex = '|'.join(re.escape(t) for t in (team_names_from_kg or [])) or \
-                     "arsenal|liverpool|man city|manchester city|chelsea|tottenham|man utd|manchester united|newcastle|brighton|aston villa|west ham|crystal palace|wolves|fulham|brentford|nottm forest|everton|leicester|leeds|southampton|bournemouth|burnley"
-        player_regex = '|'.join(re.escape(p) for p in (player_names_from_kg or [])) or \
-                      "mohamed salah|harry kane|kevin de bruyne|bruno fernandes|son heung-min|erling haaland"
-        self.entity_patterns = {
-            'player_name': r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b',
-            'team_name': rf'\b({team_regex})\b',
-            'position': r'\b(DEF|MID|FWD|GK|defender|midfielder|forward|goalkeeper)\b',
-            'season': r'\b(2021-22|2022-23|2023-24)\b',
-            'gameweek': r'\b(?:GW|gameweek|week)\s*(\d+)\b',
-            'stat_metric': r'\b(goals|assists|points|minutes|clean sheets)\b',
+
+        self.position_map = {
+            'defender':'DEF', 'defenders':'DEF', 'defence':'DEF', 'def':'DEF',
+            'midfielder':'MID', 'midfielders':'MID', 'midfield':'MID', 'mid':'MID',
+            'forward':'FWD', 'forwards':'FWD', 'striker':'FWD', 'fwd':'FWD',
+            'goalkeeper':'GK', 'goalkeepers':'GK', 'gk':'GK'
         }
-        self.position_map = {'defender':'DEF','midfielder':'MID','forward':'FWD','goalkeeper':'GK',
-                             'def':'DEF','mid':'MID','fwd':'FWD','gk':'GK'}
-        self.embedding_model = SentenceTransformer(embedding_model_name, device='cpu')
+
+        try: self.embedding_model = SentenceTransformer(embedding_model_name)
+        except: self.embedding_model = None
 
     def classify_intent(self, query: str) -> Tuple[str, float]:
         query_lower = query.lower()
         scores = {intent: 0.0 for intent in self.intent_patterns}
         for intent, patterns in self.intent_patterns.items():
-            for pat in patterns:
-                scores[intent] += len(re.findall(pat, query_lower))
+            for pat, weight in patterns:
+                if re.search(pat, query_lower): scores[intent] += weight
         if max(scores.values()) == 0: return 'general_query', 0.5
-        best = max(scores, key=scores.get)
-        return best, min(1.0, scores[best] / len(self.intent_patterns[best]))
+        return max(scores, key=scores.get), 0.8
 
     def extract_entities(self, query: str) -> Dict[str, List[str]]:
-        entities = {}
-        for ent_type, pat in self.entity_patterns.items():
-            matches = re.findall(pat, query, re.IGNORECASE)
-            if ent_type == 'gameweek':
-                entities[ent_type] = [m if isinstance(m, str) else m[1] for m in matches]
-            elif ent_type == 'position':
-                entities[ent_type] = list({self.position_map.get(m.lower(), m.upper()) for m in matches})
-            else:
-                entities[ent_type] = list({m if isinstance(m, str) else m[0] for m in matches})
-        if 'player_name' not in entities:
-            caps = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', query)
-            entities['player_name'] = [c for c in caps if c.lower() not in {'which','recommend','compare','show'}]
-        return {k: v for k, v in entities.items() if v}
+        entities = {'player_name': [], 'team_name': [], 'position': [], 'gameweek': [], 'numeric_value': [], 'season': []}
+        query_lower = query.lower()
+
+        if self.valid_players:
+            for db_player in self.valid_players:
+                db_p_lower = db_player.lower()
+                if db_p_lower in query_lower:
+                    entities['player_name'].append(db_player)
+                    continue
+                parts = db_p_lower.split()
+                if len(parts) > 1 and re.search(r'\b' + re.escape(parts[-1]) + r'\b', query_lower):
+                    entities['player_name'].append(db_player)
+
+        if self.valid_teams:
+            for db_team in self.valid_teams:
+                if db_team.lower() in query_lower: entities['team_name'].append(db_team)
+
+        for word, code in self.position_map.items():
+            if re.search(r'\b' + re.escape(word) + r'\b', query_lower): entities['position'].append(code)
+        
+        numbers = re.findall(r'\b(\d+)\b', query)
+        if numbers:
+            entities['numeric_value'] = numbers
+            if 'gw' in query_lower or 'gameweek' in query_lower: entities['gameweek'] = numbers
+
+        seasons = re.findall(r'\b(202[0-9]-2[0-9])\b', query)
+        if seasons: entities['season'] = seasons
+
+        for k in entities: entities[k] = list(set(entities[k]))
+        return entities
 
     def generate_embedding(self, query: str) -> np.ndarray:
-        return self.embedding_model.encode(query, convert_to_numpy=True)
+        if self.embedding_model: return self.embedding_model.encode(query, convert_to_numpy=True)
+        return np.zeros(384)
 
     def build_cypher_params(self, entities: Dict[str, List[str]], intent: str) -> Dict[str, any]:
         p = {}
-        if 'player_name' in entities:
-            p['player_names'] = entities['player_name']
-            p['player_name']  = entities['player_name'][0]
-            if intent == 'player_comparison' and len(entities['player_name']) >= 2:
-                p['player1'] = entities['player_name'][0]
-                p['player2'] = entities['player_name'][1]
-        if 'team_name' in entities:
-            p['team_names'] = entities['team_name']
-            p['team_name']  = entities['team_name'][0]
-        if 'position' in entities:
-            p['positions'] = entities['position']
-            p['position']   = entities['position'][0]
-        if 'season' in entities:
-            p['seasons'] = entities['season']
-            p['season']    = entities['season'][0]
-        if 'gameweek' in entities:
-            p['gameweeks'] = [int(g) for g in entities['gameweek']]
-            p['gameweek']  = int(entities['gameweek'][0])
+        if entities['player_name']:
+            sorted_p = sorted(entities['player_name'], key=len, reverse=True)
+            p['player_name'] = sorted_p[0]
+            p['player_names'] = sorted_p
+            if len(sorted_p) >= 2:
+                p['player1'] = sorted_p[0]; p['player2'] = sorted_p[1]
+        
+        if entities['team_name']: p['team_name'] = entities['team_name'][0]
+        if entities['position']: p['position'] = entities['position'][0]
+        if entities['season']: p['season'] = entities['season'][0]
+        if entities['gameweek']: 
+            try: p['gameweek'] = int(entities['gameweek'][0])
+            except: pass
+        p['threshold'] = 0
+        if entities['numeric_value']:
+            try: p['threshold'] = int(entities['numeric_value'][0])
+            except: pass
         return p
 
     def process(self, query: str) -> ProcessedInput:
         intent, conf = self.classify_intent(query)
         entities = self.extract_entities(query)
-        emb = self.generate_embedding(query)
         params = self.build_cypher_params(entities, intent)
-        return ProcessedInput(query, intent, conf, entities, emb, params)
+        return ProcessedInput(query, intent, conf, entities, None, params)
+
+PREPROC = FPLInputPreprocessor(KG_TEAMS, KG_PLAYERS)
 
 # ------------------------------------------------------
-# 2.  Cypher templates (≥10)
+# 3.  Cypher Templates
 # ------------------------------------------------------
 CYPHER_TEMPLATES = {
-    'player_performance': """
-        MATCH (p:Player {player_name: $player_name})-[r:PLAYED_IN]->(f:Fixture)
-        RETURN  p.player_name AS player,
-                SUM(r.total_points) AS total_points,
-                SUM(r.goals_scored) AS goals,
-                SUM(r.assists) AS assists,
-                SUM(r.minutes) AS minutes,
-                COUNT(f) AS matches
-    """,
-    'player_comparison': """
+    'player_performance': f"""
         MATCH (p:Player)-[r:PLAYED_IN]->(f:Fixture)
-        WHERE p.player_name IN [$player1, $player2]
-        RETURN  p.player_name AS player,
-                SUM(r.total_points) AS points,
-                SUM(r.goals_scored) AS goals,
-                SUM(r.assists) AS assists,
-                SUM(r.minutes) AS minutes
+        WHERE toLower(p.{PLAYER_PROP}) CONTAINS toLower($player_name)
+        RETURN  p.{PLAYER_PROP} AS player, SUM(r.total_points) AS total_points, SUM(r.goals_scored) AS goals, SUM(r.assists) AS assists, SUM(r.minutes) AS minutes, COUNT(f) AS matches
+    """,
+    'player_comparison': f"""
+        MATCH (p:Player)-[r:PLAYED_IN]->(f:Fixture)
+        WHERE p.{PLAYER_PROP} IN $player_names
+        RETURN  p.{PLAYER_PROP} AS player, SUM(r.total_points) AS points, SUM(r.goals_scored) AS goals, SUM(r.assists) AS assists
         ORDER BY points DESC
     """,
-    'team_analysis': """
-        MATCH (t:Team {name: $team_name})<-[:HAS_HOME_TEAM|HAS_AWAY_TEAM]-(f:Fixture)
+    'team_analysis': f"""
+        MATCH (t:Team)<-[:HAS_HOME_TEAM|HAS_AWAY_TEAM]-(f:Fixture)
+        WHERE toLower(t.{TEAM_PROP}) CONTAINS toLower($team_name)
         WITH f
         MATCH (p:Player)-[r:PLAYED_IN]->(f)
-        RETURN  COUNT(DISTINCT f) AS matches,
-                SUM(r.goals_scored) AS goals_scored,
-                SUM(r.clean_sheets) AS clean_sheets
+        RETURN  COUNT(DISTINCT f) AS matches, SUM(r.goals_scored) AS goals_scored, SUM(r.clean_sheets) AS clean_sheets
     """,
-    'fixture_query': """
+    'fixture_query': f"""
         MATCH (f:Fixture)-[:HAS_HOME_TEAM]->(t1:Team)
         MATCH (f)-[:HAS_AWAY_TEAM]->(t2:Team)
         WHERE f.gameweek = $gameweek
-        RETURN  t1.name AS home, t2.name AS away, f.gameweek AS gameweek
-    """,
-    'position_analysis': """
-        MATCH (p:Player)-[:PLAYS_AS]->(pos:Position {name: $position})
-        MATCH (p)-[r:PLAYED_IN]->(f:Fixture)
-        WITH p, SUM(r.total_points) AS tp, SUM(r.goals_scored) AS g, SUM(r.assists) AS a
-        ORDER BY tp DESC
+        RETURN  t1.{TEAM_PROP} AS home, t2.{TEAM_PROP} AS away, f.gameweek AS gameweek
         LIMIT 10
-        RETURN  p.player_name AS player, tp AS total_points, g AS goals, a AS assists
     """,
-    'season_comparison': """
-        MATCH (p:Player {player_name: $player_name})-[r:PLAYED_IN]->(f:Fixture)
-        RETURN  f.season AS season,
-                SUM(r.total_points) AS points,
-                SUM(r.goals_scored) AS goals,
-                SUM(r.assists) AS assists
-        ORDER BY season
+    'position_analysis': f"""
+        MATCH (p:Player)-[:PLAYS_AS]->(pos:Position {{name: $position}})
+        MATCH (p)-[r:PLAYED_IN]->(f:Fixture)
+        WITH p, SUM(r.total_points) AS tp, SUM(r.goals_scored) AS g
+        WHERE g >= $threshold
+        ORDER BY tp DESC LIMIT 10
+        RETURN  p.{PLAYER_PROP} AS player, tp AS total_points, g AS goals
     """,
-    'recommendation': """
-        MATCH (p:Player)-[r:PLAYED_IN]->(f:Fixture)
-        WITH p, SUM(r.total_points) AS tp, AVG(r.form) AS af
-        ORDER BY tp DESC
-        LIMIT 5
-        RETURN  p.player_name AS player, tp AS total_points, af AS avg_form
-    """,
-    'search_player': """
-        MATCH (p:Player {player_name: $player_name})
-        OPTIONAL MATCH (p)-[:PLAYS_AS]->(pos:Position)
-        OPTIONAL MATCH (p)-[:BELONGS_TO]->(t:Team)
-        RETURN  p.player_name AS player, pos.name AS position, t.name AS team
-    """,
-    'general_query': """
+    'general_query': f"""
         MATCH (p:Player)-[r:PLAYED_IN]->(f:Fixture)
         WITH p, SUM(r.total_points) AS tp
-        ORDER BY tp DESC
-        LIMIT 10
-        RETURN  p.player_name AS player, tp AS total_points
-    """,
+        ORDER BY tp DESC LIMIT 5
+        RETURN  p.{PLAYER_PROP} AS player, tp AS total_points
+    """
 }
 
 # ------------------------------------------------------
-# 3.  Neo4j wrapper
+# 4.  Readable Response Generator (The Logic You Need)
 # ------------------------------------------------------
-class Neo4jExecutor:
-    def __init__(self, uri, user, pwd):
-        self.driver = GraphDatabase.driver(uri, auth=(user, pwd))
-    def close(self): self.driver.close()
-    def run(self, query, params=None):
-        with self.driver.session() as s:
-            return [r.data() for r in s.run(query, params or {})]
+def format_response(intent, data, model_name):
+    if not data or "error" in str(data):
+        return "I couldn't find any relevant data in the Knowledge Graph for your query."
 
-# ------------------------------------------------------
-# 4.  Global singletons
-# ------------------------------------------------------
-CONFIG   = read_config()
-NEO      = Neo4jExecutor(CONFIG['URI'], CONFIG['USERNAME'], CONFIG['PASSWORD'])
-team_names   = [r['name'] for r in NEO.run("MATCH (t:Team) RETURN t.name AS name")]
-player_names = [r['name'] for r in NEO.run("MATCH (p:Player) RETURN p.player_name AS name")]
-PREPROC = FPLInputPreprocessor(team_names_from_kg=team_names, player_names_from_kg=player_names)
-atexit.register(NEO.close)
+    # Generate natural language based on intent
+    response = ""
+    
+    if intent == 'player_performance':
+        # Single player stats
+        row = data[0]
+        response = f"**{row.get('player')}** has played {row.get('matches')} matches, scoring **{row.get('goals')} goals** and providing **{row.get('assists')} assists**, totaling {row.get('total_points')} points."
 
-# ------------------------------------------------------
-# 5.  Functions the UI calls
-# ------------------------------------------------------
-def classify_intent(query: str):          
-    return PREPROC.classify_intent(query)
+    elif intent == 'player_comparison':
+        # Comparison table/list
+        response = "**Player Comparison:**\n"
+        for row in data:
+            response += f"- **{row.get('player')}**: {row.get('points')} pts | {row.get('goals')} goals | {row.get('assists')} assists\n"
 
-def extract_entities(query: str):         
-    return PREPROC.extract_entities(query)
+    elif intent == 'team_analysis':
+        row = data[0]
+        response = f"The team has scored **{row.get('goals_scored')} goals** and kept **{row.get('clean_sheets')} clean sheets** in {row.get('matches')} matches."
+
+    elif intent == 'fixture_query':
+        response = f"**Fixtures for Gameweek {data[0].get('gameweek')}:**\n"
+        for row in data:
+            response += f"- {row.get('home')} vs {row.get('away')}\n"
+
+    elif intent in ['position_analysis', 'recommendation', 'general_query']:
+        # Top lists
+        response = "**Top Players Found:**\n"
+        for i, row in enumerate(data, 1):
+            response += f"{i}. **{row.get('player')}** - {row.get('total_points')} pts ({row.get('goals', 0)} goals)\n"
+    
+    else:
+        # Fallback
+        response = "Here is the data found:\n" + str(data)
+
+    return f"{response}\n\n*(Generated by {model_name} simulation)*"
 
 def build_cypher(intent, entities):       
-    processed = PREPROC.process("dummy")
-    processed.entities = entities
-    processed.intent   = intent
     params = PREPROC.build_cypher_params(entities, intent)
     tmpl   = CYPHER_TEMPLATES.get(intent, CYPHER_TEMPLATES['general_query'])
     return tmpl, params
 
-def kg_retrieve_baseline(cypher: str, params: dict):
-    return NEO.run(cypher, params)
-
-def kg_retrieve_embedding(query_vec, top_k=5):
-    # placeholder – swap in real vector search later
-    return []
-
-def llm_answer(model: str, context: str, query: str):
-    persona = "You are an FPL expert assistant."
-    task    = "Answer the question using only the provided knowledge-graph context."
-    prompt  = f"{persona}\n\nContext:\n{context}\n\nUser: {query}\nAssistant:"
-    # stub answers – wire real LLM here
-    if "gpt-4" in model.lower():
-        return f"(GPT-4) Based on the data: {context}"
-    if "llama" in model.lower():
-        return f"(Llama-3) Based on the data: {context}"
-    return f"(GPT-3.5) Based on the data: {context}"
-
 # ============================================================================
-# STREAMLIT UI PART (unchanged from earlier version)
+# STREAMLIT APP
 # ============================================================================
 st.set_page_config(page_title="Graph-RAG FPL Assistant", layout="wide")
-SESSION = st.session_state
-if "history" not in SESSION:
-    SESSION.history = []
+if "history" not in st.session_state: st.session_state.history = []
 
-# ---------- SIDEBAR ----------
 with st.sidebar:
-    st.title("⚙️ Controls")
-    model = st.selectbox("LLM model", ["gpt-3.5", "gpt-4", "llama-3"])
-    retrieval = st.radio("Retrieval method", ["Baseline (Cypher)", "Embedding", "Both"], index=0)
-    show_cypher = st.checkbox("Show executed Cypher", value=True)
-    show_graph = st.checkbox("Show graph snippet", value=True)
-    if st.button("🗑️ Clear history"):
-        SESSION.history.clear()
+    st.title("⚙️ FPL Assistant")
+    model = st.selectbox("LLM", ["gpt-3.5", "gpt-4", "llama-3"])
+    show_cypher = st.checkbox("Debug Mode", value=True)
+    if st.button("Clear History"): st.session_state.history = []
+    st.divider()
+    st.success(f"Schema: Player=`{PLAYER_PROP}`, Team=`{TEAM_PROP}`")
+    st.info(f"Loaded: {len(KG_PLAYERS)} Players")
 
-# ---------- MAIN ----------
-st.title("Graph-RAG FPL Assistant")
-st.markdown("Ask anything about players, teams, gameweeks or stats.")
-
-query = st.text_input("Your question:", placeholder="e.g. Best midfielders under 11.0 for 2023")
+st.title("⚽ Graph-RAG FPL Assistant")
+query = st.text_input("Ask about FPL:", placeholder="e.g. How many goals did Salah score?")
 
 if st.button("Run") and query:
-    with st.spinner("Thinking…"):
-        intent, conf = classify_intent(query)
-        entities = extract_entities(query)
-        cypher_sql, cypher_params = build_cypher(intent, entities)
-
-        kg_context = []
-        if retrieval in ["Baseline (Cypher)", "Both"]:
-            kg_context += kg_retrieve_baseline(cypher_sql, cypher_params)
-        if retrieval in ["Embedding", "Both"]:
-            kg_context += kg_retrieve_embedding(PREPROC.generate_embedding(query))
-        kg_context = pd.DataFrame(kg_context).drop_duplicates().to_dict("records")
-
-        context_str = json.dumps(kg_context, indent=2, ensure_ascii=False)
-        answer = llm_answer(model, context_str, query)
-
-        SESSION.history.append({
-            "q": query,
-            "cypher": cypher_sql,
-            "params": cypher_params,
-            "kg": kg_context,
-            "answer": answer,
-            "model": model,
-            "retrieval": retrieval,
-            "time": pd.Timestamp.now().strftime("%H:%M:%S")
+    with st.spinner("Processing..."):
+        processed = PREPROC.process(query)
+        cypher, params = build_cypher(processed.intent, processed.entities)
+        
+        kg_res = NEO.run(cypher, params)
+        
+        # USE THE NEW FORMATTER
+        readable_answer = format_response(processed.intent, kg_res, model)
+        
+        st.session_state.history.append({
+            "q": query, 
+            "intent": processed.intent, 
+            "cypher": cypher, 
+            "params": params, 
+            "kg": kg_res, 
+            "answer": readable_answer
         })
 
-# ---------- HISTORY ----------
-for turn in reversed(SESSION.history):
-    st.markdown(f"### 🧑 {turn['q']}  *({turn['time']})*")
-    c1, c2 = st.columns([1, 2])
+for turn in reversed(st.session_state.history):
+    st.markdown(f"### 🧑 {turn['q']}")
+    c1, c2 = st.columns([1,2])
     with c1:
-        st.markdown("**Retrieved KG context**")
-        st.dataframe(turn["kg"])
+        st.markdown("**Knowledge Graph Data**")
+        st.json(turn["kg"], expanded=False)
     with c2:
-        st.markdown("**FPL advice**")
-        st.markdown(turn["answer"])
-
+        st.markdown("**Answer**")
+        st.info(turn["answer"])
+    
     if show_cypher:
-        with st.expander("Cypher query"):
+        with st.expander("Technical Details"):
             st.code(turn["cypher"], language="cypher")
-            st.json(turn["params"])
-    if show_graph and turn["kg"]:
-        with st.expander("Graph snippet"):
-            import networkx as nx
-            G = nx.Graph()
-            for rec in turn["kg"]:
-                node_id = rec.get('player') or rec.get('player_name') or str(hash(str(rec)))
-                G.add_node(node_id, label=node_id, title=str(rec))
-            net = Network(height="300px", bgcolor="#ffffff", font_color="black")
-            net.from_nx(G)
-            net.repulsion()
-            net.show("kg.html")
-            HtmlFile = open("kg.html", "r", encoding="utf-8")
-            components.html(HtmlFile.read(), height=350)
-    st.markdown("---")
+            st.write(f"Intent: `{turn['intent']}`")
+    st.divider()
