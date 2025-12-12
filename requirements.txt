@@ -1,6 +1,6 @@
 streamlit
 pandas
-numpy
 neo4j
 sentence-transformers
-huggingface_hub
+pyvis
+networkx
